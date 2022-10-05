@@ -1,22 +1,28 @@
-#include "tev.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/epoll.h>
-#include <sys/time.h>
+#include <limits.h>
+#include "tev.h"
+#include "FreeRTOS.h"
+#include "semphr.h"
+#include "list.h"
 #include "cHeap/heap.h"
 #include "map/map.h"
+
 
 /* structs */
 
 typedef struct
 {
-    int epollfd;
-    // used to assist epoll
-    map_handle_t fd_handlers;
+    // event fifo
+    SemaphoreHandle_t mutex;
+    SemaphoreHandle_t semaphore;
+    list_handle_t fifo;
+    // events
+    map_handle_t events;
     // timers is a minimum heap
     heap_handle_t timers;
 } tev_t;
@@ -31,16 +37,23 @@ typedef struct
 
 typedef struct
 {
-    int fd;
-    void(*read_handler)(void* ctx);
-    void* read_ctx;
-    void(*write_handler)(void* ctx);
-    void* write_ctx;
-} tev_fd_handler_t;
+    tev_event_handler_t handler;
+    void* handler_ctx;
+} tev_event_t;
+
+typedef struct
+{
+    tev_event_handle_t handle;
+    void* data;
+    int len;
+} tev_event_data_t;
 
 /* pre defined functions */
-timestamp_t get_now_ms(void);
-bool compare_timeout(void* A,void* B);
+static timestamp_t get_now_ms(void);
+static bool compare_timeout(void* A,void* B);
+static tev_event_data_t* tev_event_data_new(tev_event_handle_t handle, void* data, int len);
+static void tev_event_data_free(tev_event_data_t* event);
+static void tev_event_data_free_with_ctx(void* data, void* ctx);
 
 /* Flow control */
 
@@ -49,19 +62,28 @@ tev_handle_t tev_create_ctx(void)
     tev_t *tev = malloc(sizeof(tev_t));
     if(!tev)
         goto error;
-    memset(tev,0,sizeof(*tev));
-    tev->epollfd = -1;
+    memset(tev,0,sizeof(tev_t));
+
+    tev->mutex = NULL;
+    tev->semaphore = NULL;
+    tev->fifo = NULL;
     tev->timers = NULL;
-    tev->fd_handlers = NULL;
-    // create epoll fd
-    tev->epollfd = epoll_create1(0);
-    if(tev->epollfd == -1)
+    tev->events = NULL;
+
+    // create fifo
+    tev->fifo = list_new();
+    if(!tev->fifo)
         goto error;
-    // create fd handler list
-    tev->fd_handlers = map_create();
-    if(!tev->fd_handlers)
+    tev->mutex = xSemaphoreCreateMutex();
+    if(!tev->mutex)
         goto error;
-    // create timer list
+    tev->semaphore = xSemaphoreCreateCounting(INT_MAX,0);
+
+    // create event map
+    tev->events = map_create();
+    if(!tev->events)
+        goto error;
+    // create timer heap
     tev->timers = heap_create(compare_timeout);
     if(!tev->timers)
         goto error;
@@ -70,26 +92,52 @@ tev_handle_t tev_create_ctx(void)
 error:
     if(tev)
     {
-        if(tev->epollfd != -1)
-            close(tev->epollfd);
+        if(tev->semaphore)
+            vSemaphoreDelete(tev->semaphore);
+        if(tev->mutex)
+            vSemaphoreDelete(tev->mutex);
+        if(tev->fifo)
+            list_free(tev->fifo,NULL,NULL);
         if(tev->timers != NULL)
             heap_free(tev->timers,NULL);
-        if(tev->fd_handlers != NULL)
-            map_delete(tev->fd_handlers,NULL,NULL);
+        if(tev->events != NULL)
+            map_delete(tev->events,NULL,NULL);
         free(tev);
     }
     return NULL;
 }
 
-#define MAX_EPOLL_EVENTS 10
+static void free_with_ctx(void* ptr,void* ctx)
+{
+    free(ptr);
+}
+
+void tev_free_ctx(tev_handle_t handle)
+{
+    tev_t* tev = (tev_t*)handle;
+    if(tev)
+    {
+        if(tev->timers)
+            heap_free(tev->timers,free);
+        if(tev->events)
+            map_delete(tev->events,free_with_ctx,NULL);
+        if(tev->fifo)
+            list_free(tev->fifo,tev_event_data_free_with_ctx,NULL);
+        if(tev->semaphore)
+            vSemaphoreDelete(tev->semaphore);
+        if(tev->mutex)
+            vSemaphoreDelete(tev->mutex);
+        free(tev);
+    }
+}
+
+
 void tev_main_loop(tev_handle_t handle)
 {
-    if(handle == NULL)
-    {
-        return;
-    }
     tev_t *tev = (tev_t *)handle;
-    struct epoll_event events[MAX_EPOLL_EVENTS];
+    if(!tev)
+        return;
+    
     int next_timeout;
     for(;;)
     {
@@ -119,7 +167,7 @@ void tev_main_loop(tev_handle_t handle)
             }
         }
         // are there any files to listen to
-        if(next_timeout == 0 && map_get_length(tev->fd_handlers)!=0)
+        if(next_timeout == 0 && map_get_length(tev->events)!=0)
         {
             next_timeout = -1;
         }
@@ -129,58 +177,54 @@ void tev_main_loop(tev_handle_t handle)
             // neither timer nor fds exist
             break;
         }
-        int nfds = epoll_wait(tev->epollfd,events,MAX_EPOLL_EVENTS,next_timeout);
-        // handle files
-        for(int i=0;i<nfds;i++)
+        
+        // timeout ms to tick
+        uint32_t next_timeout_tick = 0;
+        if(next_timeout == -1)
+            next_timeout_tick = portMAX_DELAY;
+        else
+            next_timeout_tick = next_timeout/(1000/configTICK_RATE_HZ);
+        
+        int has_event = xSemaphoreTake(tev->semaphore,next_timeout_tick);
+
+        // handle event
+        if(has_event == pdTRUE)
         {
-            tev_fd_handler_t *fd_handler = (tev_fd_handler_t*)events[i].data.ptr;
-            if(fd_handler != NULL)
+            tev_event_data_t* event_data = NULL;
+            xSemaphoreTake(tev->mutex,portMAX_DELAY);
+            event_data = list_shift(tev->fifo);
+            xSemaphoreGive(tev->mutex);
+            if(event_data)
             {
-                if((events[i].events & EPOLLIN) && fd_handler->read_handler)
-                    fd_handler->read_handler(fd_handler->read_ctx);
-                if((events[i].events & EPOLLOUT) && fd_handler->write_handler)
-                    fd_handler->write_handler(fd_handler->write_ctx);
+                tev_event_t* event = map_get(tev->events,&(event_data->handle),sizeof(event_data->handle));
+                if(event)
+                {
+                    if(event->handler)
+                        event->handler(event_data->data,event_data->len,event->handler_ctx);
+                }
+                tev_event_data_free(event_data);
             }
         }
     }
 }
 
-void free_with_ctx(void* ptr,void* ctx)
-{
-    free(ptr);
-}
 
-void tev_free_ctx(tev_handle_t handle)
-{
-    if(handle == NULL)
-    {
-        return;
-    }
-    tev_t *tev = (tev_t *)handle;
-    close(tev->epollfd);
-    heap_free(tev->timers,free);
-    map_delete(tev->fd_handlers,free_with_ctx,NULL);
-    free(tev);
-}
 
 /* Timeout */
 
-timestamp_t get_now_ms(void)
+static timestamp_t get_now_ms(void)
 {
-    struct timeval now;
-    gettimeofday(&now,NULL);
-    timestamp_t now_ts = (timestamp_t)now.tv_sec * 1000 + (timestamp_t)now.tv_usec/1000;
-    return now_ts;
+    return ((timestamp_t)xTaskGetTickCount()) * (timestamp_t)1000 / (timestamp_t)configTICK_RATE_HZ;
 }
 
-bool compare_timeout(void* A,void* B)
+static bool compare_timeout(void* A,void* B)
 {
     tev_timeout_t* timeout_A = (tev_timeout_t*)A;
     tev_timeout_t* timeout_B = (tev_timeout_t*)B;
     return timeout_A->target > timeout_B->target;
 }
 
-tev_timeout_handle_t tev_set_timeout(tev_handle_t handle, void (*handler)(void *ctx), void *ctx, int64_t timeout_ms)
+tev_timeout_handle_t tev_set_timeout(tev_handle_t handle, tev_timeout_handler_t handler, void *ctx, int64_t timeout_ms)
 {
     if(handle == NULL)
         return NULL;
@@ -201,7 +245,7 @@ tev_timeout_handle_t tev_set_timeout(tev_handle_t handle, void (*handler)(void *
     return (tev_timeout_handle_t)new_timeout;
 }
 
-bool match_by_data_ptr(void* data, void* arg)
+static bool match_by_data_ptr(void* data, void* arg)
 {
     return data == arg;
 }
@@ -216,103 +260,125 @@ int tev_clear_timeout(tev_handle_t tev_handle, tev_timeout_handle_t handle)
     return 0;
 }
 
-/* Fd read handler */
+/* Event handler */
 
-bool match_handler_by_fd(void* data, void* arg)
+static tev_event_data_t* tev_event_data_new(tev_event_handle_t handle, void* data, int len)
 {
-    int fd = *(int*)arg;
-    tev_fd_handler_t *fd_handler = (tev_fd_handler_t *)data;
-    return fd_handler->fd == fd;
+    tev_event_data_t* event_data = NULL;
+
+    event_data = malloc(sizeof(tev_event_data_t));
+    if(!event_data)
+        goto error;
+    memset(event_data,0,sizeof(tev_event_data_t));
+
+    event_data->handle = handle;
+    if(data != NULL && len != 0)
+    {
+        event_data->data = malloc(len);
+        if(!event_data->data)
+            goto error;
+        memcpy(event_data->data,data,len);
+    }
+
+    return event_data;
+error:
+    if(event_data)
+    {
+        if(event_data->data)
+            free(event_data->data);
+        free(event_data);
+    }
+    return NULL;
+} 
+
+static void tev_event_data_free(tev_event_data_t* event)
+{
+    if(event)
+    {
+        if(event->data)
+            free(event->data);
+        free(event);
+    }
 }
 
-static int tev_set_read_write_handler(tev_handle_t handle, int fd, void (*handler)(void* ctx), void* ctx, bool is_read)
+static void tev_event_data_free_with_ctx(void* data, void* ctx)
 {
-    if(!handle)
-        return -1;
+    tev_event_data_free((tev_event_data_t*)data);
+}
+
+tev_event_handle_t tev_set_event_handler(tev_handle_t handle, tev_event_handler_t handler, void* ctx)
+{
+    tev_event_t* event = NULL;
+    bool event_added = false;
+
     tev_t *tev = (tev_t *)handle;
-    tev_fd_handler_t *fd_handler = map_get(tev->fd_handlers,&fd,sizeof(fd));
-    /* create fd_handler if none */
-    if(fd_handler == NULL)
+    if(!tev)
+        goto error;
+
+    /* create fd_handler */
+    event = malloc(sizeof(tev_event_t));
+    if(!event)
+        goto error;
+    memset(event,0,sizeof(tev_event_t));
+    event->handler = handler;
+    event->handler_ctx = ctx;
+
+    /* add event to map */
+    if(map_add(tev->events,&event,sizeof(event),event) == NULL)
+        goto error;
+    event_added = true;
+
+    return (tev_event_handle_t)event;
+error:
+    if(event)
     {
-        fd_handler = malloc(sizeof(tev_fd_handler_t));
-        if(!fd_handler)
-            return -1;
-        memset(fd_handler,0,sizeof(tev_fd_handler_t));
-        fd_handler->fd = fd;
-        fd_handler->read_handler = NULL;
-        fd_handler->read_ctx = NULL;
-        fd_handler->write_handler = NULL;
-        fd_handler->write_ctx = NULL;
-        if(map_add(tev->fd_handlers,&fd,sizeof(fd),fd_handler)==NULL)
-        {
-            free(fd_handler);
-            return -1;
-        }
+        if(event_added)
+            map_remove(tev->events,&event,sizeof(event));
+        free(event);
     }
-    /* adjust the content of fd_handler */
-    bool read_handler_existed = fd_handler->read_handler != NULL;
-    bool write_handler_existed = fd_handler->write_handler != NULL;
-    if(is_read)
-    {
-        fd_handler->read_handler = handler;
-        fd_handler->read_ctx = ctx;
-    }
-    else
-    {
-        fd_handler->write_handler = handler;
-        fd_handler->write_ctx = ctx;
-    }
-    /* change epoll settings */
-    if((fd_handler->read_handler == NULL) && (fd_handler->write_handler == NULL))
-    {
-        /* remove from epoll and map */
-        epoll_ctl(tev->epollfd,EPOLL_CTL_DEL,fd,NULL);
-        map_remove(tev->fd_handlers,&fd,sizeof(fd));
-        free(fd_handler);
-    }
-    else if((!read_handler_existed) && (!write_handler_existed))
-    {
-        /* add to epoll */
-        struct epoll_event ev;
-        memset(&ev,0,sizeof(ev));
-        if(fd_handler->read_handler != NULL)
-            ev.events |= EPOLLIN;
-        if(fd_handler->write_handler != NULL)
-            ev.events |= EPOLLOUT;
-        ev.data.ptr = fd_handler;
-        if(epoll_ctl(tev->epollfd,EPOLL_CTL_ADD,fd,&ev) < 0)
-        {
-            map_remove(tev->fd_handlers,&fd,sizeof(fd));
-            free(fd_handler);
-            return -1;
-        }
-    }
-    else if( (read_handler_existed != (fd_handler->read_handler!=NULL)) || (write_handler_existed != (fd_handler->write_handler!=NULL)) )
-    {
-        /* adjust epoll if needed */
-        struct epoll_event ev;
-        memset(&ev,0,sizeof(ev));
-        if(fd_handler->read_handler != NULL)
-            ev.events |= EPOLLIN;
-        if(fd_handler->write_handler != NULL)
-            ev.events |= EPOLLOUT;
-        ev.data.ptr = fd_handler;
-        if(epoll_ctl(tev->epollfd,EPOLL_CTL_MOD,fd,&ev) < 0)
-        {
-            map_remove(tev->fd_handlers,&fd,sizeof(fd));
-            free(fd_handler);
-            return -1;
-        }
-    }
+    return NULL;
+}
+
+int tev_clear_event_handler(tev_handle_t handle, tev_event_handle_t event_handle)
+{
+    tev_t* tev = (tev_t*)handle;
+    if(!tev)
+        goto error;
+
+    tev_event_t* event = map_remove(tev->events,&event_handle,sizeof(event_handle));
+    if(event)
+        free(event);
+
     return 0;
+error:
+    return -1;
 }
 
-int tev_set_read_handler(tev_handle_t handle, int fd, void (*handler)(void *ctx), void *ctx)
+int tev_send_event(tev_handle_t handle, tev_event_handle_t event, void* data, int len)
 {
-    return tev_set_read_write_handler(handle,fd,handler,ctx,true);
-}
+    int ret = 0;
+    /* This should not be called from ISR */
+    if(xPortIsInsideInterrupt()==pdTRUE)
+        return -1;
 
-int tev_set_write_handler(tev_handle_t handle, int fd, void (*handler)(void* ctx), void* ctx)
-{
-    return tev_set_read_write_handler(handle,fd,handler,ctx,false);
+    tev_t* tev = (tev_t*)handle;
+    if(!tev)
+        return -1;
+
+    tev_event_data_t* event_data = tev_event_data_new(event,data,len);
+    if(!event_data)
+        return -1;
+
+    xSemaphoreTake(tev->mutex,portMAX_DELAY);
+    
+    if(list_push(tev->fifo,event_data) < 0)
+    {
+        tev_event_data_free(event_data);
+        ret = -1;
+    }
+
+    xSemaphoreGive(tev->semaphore);
+    xSemaphoreGive(tev->mutex);
+
+    return ret;
 }
