@@ -183,7 +183,7 @@ void tev_main_loop(tev_handle_t handle)
         if(next_timeout == -1)
             next_timeout_tick = portMAX_DELAY;
         else
-            next_timeout_tick = next_timeout/(1000/configTICK_RATE_HZ);
+            next_timeout_tick = next_timeout/portTICK_PERIOD_MS;
         
         int has_event = xSemaphoreTake(tev->semaphore,next_timeout_tick);
 
@@ -214,7 +214,7 @@ void tev_main_loop(tev_handle_t handle)
 
 static timestamp_t get_now_ms(void)
 {
-    return ((timestamp_t)xTaskGetTickCount()) * (timestamp_t)1000 / (timestamp_t)configTICK_RATE_HZ;
+    return ((timestamp_t)xTaskGetTickCount()) * (timestamp_t)portTICK_PERIOD_MS;
 }
 
 static bool compare_timeout(void* A,void* B)
