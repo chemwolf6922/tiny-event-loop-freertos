@@ -25,12 +25,15 @@ typedef struct
     map_handle_t events;
     // timers is a minimum heap
     heap_handle_t timers;
+    map_handle_t timer_handles;
+    tev_timeout_handle_t timer_handle_seed;
 } tev_t;
 
 typedef int64_t timestamp_t;
 typedef struct
 {
     timestamp_t target;
+    tev_timeout_handle_t handle;
     void(*handler)(void* ctx);
     void *ctx;
 } tev_timeout_t;
@@ -49,6 +52,7 @@ typedef struct
 } tev_event_data_t;
 
 /* pre defined functions */
+static tev_timeout_handle_t get_next_timer_handle(tev_t* tev);
 static timestamp_t get_now_ms(void);
 static bool compare_timeout(void* A,void* B);
 static tev_event_data_t* tev_event_data_new(tev_event_handle_t handle, void* data, int len);
@@ -68,7 +72,9 @@ tev_handle_t tev_create_ctx(void)
     tev->semaphore = NULL;
     tev->fifo = NULL;
     tev->timers = NULL;
+    tev->timer_handles = NULL;
     tev->events = NULL;
+    tev->timer_handle_seed = NULL;
 
     // create fifo
     tev->fifo = list_new();
@@ -87,6 +93,10 @@ tev_handle_t tev_create_ctx(void)
     tev->timers = heap_create(compare_timeout);
     if(!tev->timers)
         goto error;
+    // create timer handle map
+    tev->timer_handles = map_create();
+    if(!tev->timer_handles)
+        goto error;
 
     return (tev_handle_t)tev;
 error:
@@ -98,6 +108,8 @@ error:
             vSemaphoreDelete(tev->mutex);
         if(tev->fifo)
             list_free(tev->fifo,NULL,NULL);
+        if(tev->timer_handles != NULL)
+            map_delete(tev->timer_handles,NULL,NULL);
         if(tev->timers != NULL)
             heap_free(tev->timers,NULL);
         if(tev->events != NULL)
@@ -119,6 +131,8 @@ void tev_free_ctx(tev_handle_t handle)
     {
         if(tev->timers)
             heap_free(tev->timers,free);
+        if(tev->timer_handles)
+            map_delete(tev->timer_handles,NULL,NULL);
         if(tev->events)
             map_delete(tev->events,free_with_ctx,NULL);
         if(tev->fifo)
@@ -155,6 +169,7 @@ void tev_main_loop(tev_handle_t handle)
                 {
                     // heap does not manage values like array do.
                     heap_pop(tev->timers);
+                    map_remove(tev->timer_handles,&p_timeout->handle,sizeof(tev_timeout_handle_t));
                     if(p_timeout->handler != NULL)
                         p_timeout->handler(p_timeout->ctx);
                     free(p_timeout);
@@ -212,6 +227,14 @@ void tev_main_loop(tev_handle_t handle)
 
 /* Timeout */
 
+static tev_timeout_handle_t get_next_timer_handle(tev_t* tev)
+{
+    tev->timer_handle_seed++;
+    if(tev->timer_handle_seed==NULL)
+        tev->timer_handle_seed = (void*)1;
+    return tev->timer_handle_seed;
+}
+
 static timestamp_t get_now_ms(void)
 {
     return ((timestamp_t)xTaskGetTickCount()) * (timestamp_t)portTICK_PERIOD_MS;
@@ -236,13 +259,19 @@ tev_timeout_handle_t tev_set_timeout(tev_handle_t handle, tev_timeout_handler_t 
     new_timeout->target = target;
     new_timeout->ctx = ctx;
     new_timeout->handler = handler;
-    bool add_result = heap_add(tev->timers,new_timeout);
-    if(!add_result)
+    new_timeout->handle = get_next_timer_handle(tev);
+    if(!heap_add(tev->timers,new_timeout))
     {
         free(new_timeout);
         return NULL;
     }
-    return (tev_timeout_handle_t)new_timeout;
+    if(map_add(tev->timer_handles,&new_timeout->handle,sizeof(tev_timeout_handle_t),new_timeout)==NULL)
+    {
+        heap_delete(tev->timers,new_timeout);
+        free(new_timeout);
+        return NULL;
+    }
+    return new_timeout->handle;
 }
 
 static bool match_by_data_ptr(void* data, void* arg)
@@ -255,8 +284,12 @@ int tev_clear_timeout(tev_handle_t tev_handle, tev_timeout_handle_t handle)
     if(tev_handle == NULL)
         return -1;
     tev_t * tev = (tev_t *)tev_handle;
-    if(heap_delete(tev->timers,handle))
-        free(handle);
+    tev_timeout_t* timeout = map_remove(tev->timer_handles,&handle,sizeof(tev_timeout_handle_t));
+    if(timeout)
+    {
+        if(heap_delete(tev->timers,timeout)) 
+            free(timeout);
+    }
     return 0;
 }
 
