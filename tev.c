@@ -9,7 +9,7 @@
 #include "FreeRTOS.h"
 #include "semphr.h"
 #include "list.h"
-#include "cHeap/heap.h"
+#include "heap/heap.h"
 #include "map/map.h"
 
 
@@ -32,6 +32,7 @@ typedef struct
 typedef int64_t timestamp_t;
 typedef struct
 {
+    heap_pos_t pos;
     timestamp_t target;
     tev_timeout_handle_t handle;
     void(*handler)(void* ctx);
@@ -55,6 +56,8 @@ typedef struct
 static tev_timeout_handle_t get_next_timer_handle(tev_t* tev);
 static timestamp_t get_now_ms(void);
 static bool compare_timeout(void* A,void* B);
+static void timeout_set_pos(void* value, heap_pos_t pos);
+static heap_pos_t timeout_get_pos(void* value);
 static tev_event_data_t* tev_event_data_new(tev_event_handle_t handle, void* data, int len);
 static void tev_event_data_free(tev_event_data_t* event);
 static void tev_event_data_free_with_ctx(void* data, void* ctx);
@@ -90,7 +93,7 @@ tev_handle_t tev_create_ctx(void)
     if(!tev->events)
         goto error;
     // create timer heap
-    tev->timers = heap_create(compare_timeout);
+    tev->timers = heap_new(compare_timeout,timeout_set_pos,timeout_get_pos);
     if(!tev->timers)
         goto error;
     // create timer handle map
@@ -111,7 +114,7 @@ error:
         if(tev->timer_handles != NULL)
             map_delete(tev->timer_handles,NULL,NULL);
         if(tev->timers != NULL)
-            heap_free(tev->timers,NULL);
+            heap_free(tev->timers,NULL,NULL);
         if(tev->events != NULL)
             map_delete(tev->events,NULL,NULL);
         free(tev);
@@ -130,7 +133,7 @@ void tev_free_ctx(tev_handle_t handle)
     if(tev)
     {
         if(tev->timers)
-            heap_free(tev->timers,free);
+            heap_free(tev->timers,free_with_ctx,NULL);
         if(tev->timer_handles)
             map_delete(tev->timer_handles,NULL,NULL);
         if(tev->events)
@@ -247,6 +250,16 @@ static bool compare_timeout(void* A,void* B)
     return timeout_A->target > timeout_B->target;
 }
 
+static void timeout_set_pos(void* value, heap_pos_t pos)
+{
+    ((tev_timeout_t*)value)->pos = pos;
+}
+
+static heap_pos_t timeout_get_pos(void* value)
+{
+    return ((tev_timeout_t*)value)->pos;
+}
+
 tev_timeout_handle_t tev_set_timeout(tev_handle_t handle, tev_timeout_handler_t handler, void *ctx, int64_t timeout_ms)
 {
     if(handle == NULL)
@@ -260,7 +273,7 @@ tev_timeout_handle_t tev_set_timeout(tev_handle_t handle, tev_timeout_handler_t 
     new_timeout->ctx = ctx;
     new_timeout->handler = handler;
     new_timeout->handle = get_next_timer_handle(tev);
-    if(!heap_add(tev->timers,new_timeout))
+    if(heap_add(tev->timers,new_timeout)!=0)
     {
         free(new_timeout);
         return NULL;
@@ -287,8 +300,8 @@ int tev_clear_timeout(tev_handle_t tev_handle, tev_timeout_handle_t handle)
     tev_timeout_t* timeout = map_remove(tev->timer_handles,&handle,sizeof(tev_timeout_handle_t));
     if(timeout)
     {
-        if(heap_delete(tev->timers,timeout)) 
-            free(timeout);
+        heap_delete(tev->timers,timeout);
+        free(timeout);
     }
     return 0;
 }

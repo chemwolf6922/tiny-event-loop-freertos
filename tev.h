@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 
+#define TINY_EVENT_LOOP_VERSION "1.2.0"
 /**
  * Notice: 
  * As an event loop, this lib is not, will not be and should not be thread safe.
